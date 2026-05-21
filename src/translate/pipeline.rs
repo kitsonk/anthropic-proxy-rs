@@ -109,14 +109,22 @@ pub fn translate_response(
     }
 
     if let Some(tool_calls) = &choice.message.tool_calls {
+        let mut seen = Vec::new();
         for tool_call in tool_calls {
             let input: Value =
                 serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(|_| json!({}));
 
+            let name = tool_call.function.name.clone();
+            if seen.iter().any(|(s_name, s_input): &(String, Value)| *s_name == name && *s_input == input) {
+                tracing::debug!("Filtering out duplicate response tool call: {} with input {:?}", name, input);
+                continue;
+            }
+            seen.push((name.clone(), input.clone()));
+
             content.push(anthropic::ResponseContent::ToolUse {
                 content_type: "tool_use".to_string(),
                 id: tool_call.id.clone(),
-                name: tool_call.function.name.clone(),
+                name,
                 input,
             });
         }
@@ -713,6 +721,89 @@ mod tests {
         let anthropic = translate_response(response, "fallback").unwrap();
         assert_eq!(anthropic.stop_reason, Some("tool_use".to_string()));
         assert!(!anthropic.content.is_empty());
+    }
+
+    #[test]
+    fn response_deduplicates_duplicate_tool_calls() {
+        let response = openai::OpenAIResponse {
+            id: Some("chatcmpl-1".to_string()),
+            object: None,
+            created: None,
+            model: Some("gpt-4o".to_string()),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![
+                        openai::ToolCall {
+                            id: "call_abc".to_string(),
+                            call_type: "function".to_string(),
+                            function: openai::FunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: "{\"path\":\"/tmp\"}".to_string(),
+                            },
+                        },
+                        // Exact duplicate with different ID
+                        openai::ToolCall {
+                            id: "call_def".to_string(),
+                            call_type: "function".to_string(),
+                            function: openai::FunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: "{\"path\":\"/tmp\"}".to_string(),
+                            },
+                        },
+                        // Distinct tool call
+                        openai::ToolCall {
+                            id: "call_ghi".to_string(),
+                            call_type: "function".to_string(),
+                            function: openai::FunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: "{\"path\":\"/etc/hosts\"}".to_string(),
+                            },
+                        },
+                        // Exact duplicate with slightly different spacing in args
+                        openai::ToolCall {
+                            id: "call_jkl".to_string(),
+                            call_type: "function".to_string(),
+                            function: openai::FunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: "{ \"path\" : \"/tmp\" }".to_string(),
+                            },
+                        },
+                    ]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = translate_response(response, "fallback").unwrap();
+        assert_eq!(anthropic.stop_reason, Some("tool_use".to_string()));
+
+        let tool_uses: Vec<_> = anthropic.content.iter().filter_map(|c| {
+            if let anthropic::ResponseContent::ToolUse { id, name, input, .. } = c {
+                Some((id, name, input))
+            } else {
+                None
+            }
+        }).collect();
+
+        // There should be only 2 unique tool calls: /tmp and /etc/hosts.
+        // The duplicates call_def and call_jkl should be filtered out.
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0].0, "call_abc");
+        assert_eq!(tool_uses[0].1, "read_file");
+        assert_eq!(tool_uses[0].2["path"], "/tmp");
+
+        assert_eq!(tool_uses[1].0, "call_ghi");
+        assert_eq!(tool_uses[1].1, "read_file");
+        assert_eq!(tool_uses[1].2["path"], "/etc/hosts");
     }
 
     #[test]

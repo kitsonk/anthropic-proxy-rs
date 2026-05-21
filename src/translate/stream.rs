@@ -4,24 +4,32 @@ use crate::models::anthropic::{
 };
 use crate::models::openai;
 use crate::translate::core;
+use serde_json::{json, Value};
 
 #[derive(Debug)]
 enum BlockState {
     Idle,
     Thinking { index: usize },
     Text { index: usize },
-    ToolUse { index: usize },
 }
 
 impl BlockState {
     fn current_index(&self) -> Option<usize> {
         match self {
             Self::Idle => None,
-            Self::Thinking { index } | Self::Text { index } | Self::ToolUse { index } => {
+            Self::Thinking { index } | Self::Text { index } => {
                 Some(*index)
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub openai_index: usize,
 }
 
 #[derive(Debug)]
@@ -32,6 +40,7 @@ pub struct StreamState {
     block: BlockState,
     next_index: usize,
     message_started: bool,
+    pub buffered_tool_calls: Vec<BufferedToolCall>,
 }
 
 pub fn initial_state(fallback_model: String) -> StreamState {
@@ -42,6 +51,7 @@ pub fn initial_state(fallback_model: String) -> StreamState {
         block: BlockState::Idle,
         next_index: 0,
         message_started: false,
+        buffered_tool_calls: Vec::new(),
     }
 }
 
@@ -89,28 +99,37 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
         .into_iter()
         .flatten()
     {
+        flush_buffered_tool_calls(&mut events, state);
         emit_reasoning(&mut events, state, reasoning);
     }
 
     if let Some(content) = &choice.delta.content {
         if !content.is_empty() {
+            flush_buffered_tool_calls(&mut events, state);
             emit_text(&mut events, state, content);
         }
     }
 
     if let Some(tool_calls) = &choice.delta.tool_calls {
+        if !tool_calls.is_empty() {
+            close_current_block(&mut events, state);
+        }
         emit_tool_calls(&mut events, state, tool_calls);
     }
 
     if let Some(finish_reason) = &choice.finish_reason {
+        flush_buffered_tool_calls(&mut events, state);
         emit_finish(&mut events, state, finish_reason, chunk.usage.as_ref());
     }
 
     events
 }
 
-pub fn translate_done(_state: &mut StreamState) -> Vec<StreamEvent> {
-    vec![StreamEvent::MessageStop]
+pub fn translate_done(state: &mut StreamState) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    flush_buffered_tool_calls(&mut events, state);
+    events.push(StreamEvent::MessageStop);
+    events
 }
 
 pub fn translate_error(message: String) -> Vec<StreamEvent> {
@@ -126,7 +145,56 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
     if let Some(index) = state.block.current_index() {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
+        state.block = BlockState::Idle;
     }
+}
+
+fn flush_buffered_tool_calls(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
+    if state.buffered_tool_calls.is_empty() {
+        return;
+    }
+
+    let mut seen = Vec::new();
+    let buffered = std::mem::take(&mut state.buffered_tool_calls);
+
+    for btc in buffered {
+        if btc.id.is_empty() || btc.name.is_empty() {
+            continue;
+        }
+
+        let input: Value = serde_json::from_str(&btc.arguments).unwrap_or_else(|_| json!({}));
+        let name = btc.name.clone();
+
+        if seen.iter().any(|(s_name, s_input): &(String, Value)| *s_name == name && *s_input == input) {
+            tracing::debug!("Filtering out duplicate streaming tool call: {} with input {:?}", name, input);
+            continue;
+        }
+        seen.push((name, input));
+
+        let index = state.next_index;
+
+        events.push(StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStart::ToolUse {
+                id: btc.id.clone(),
+                name: btc.name.clone(),
+            },
+        });
+
+        if !btc.arguments.is_empty() {
+            events.push(StreamEvent::ContentBlockDelta {
+                index,
+                delta: Delta::InputJsonDelta {
+                    partial_json: btc.arguments.clone(),
+                },
+            });
+        }
+
+        events.push(StreamEvent::ContentBlockStop { index });
+        state.next_index = index + 1;
+    }
+
+    state.block = BlockState::Idle;
 }
 
 fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
@@ -176,40 +244,49 @@ fn emit_text(events: &mut Vec<StreamEvent>, state: &mut StreamState, content: &s
 }
 
 fn emit_tool_calls(
-    events: &mut Vec<StreamEvent>,
+    _events: &mut Vec<StreamEvent>,
     state: &mut StreamState,
     tool_calls: &[openai::DeltaToolCall],
 ) {
     for tool_call in tool_calls {
-        if let Some(id) = &tool_call.id {
-            close_current_block(events, state);
-            let index = state.next_index;
+        let openai_index = tool_call.index;
 
+        if let Some(existing) = state
+            .buffered_tool_calls
+            .iter_mut()
+            .find(|btc| btc.openai_index == openai_index)
+        {
+            if let Some(id) = &tool_call.id {
+                existing.id = id.clone();
+            }
             if let Some(function) = &tool_call.function {
                 if let Some(name) = &function.name {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index,
-                        content_block: ContentBlockStart::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                        },
-                    });
-                    state.block = BlockState::ToolUse { index };
+                    existing.name = name.clone();
+                }
+                if let Some(args) = &function.arguments {
+                    existing.arguments.push_str(args);
                 }
             }
-        }
+        } else {
+            let id = tool_call.id.clone().unwrap_or_default();
+            let mut name = String::new();
+            let mut arguments = String::new();
 
-        if let Some(function) = &tool_call.function {
-            if let Some(args) = &function.arguments {
-                if let BlockState::ToolUse { index } = state.block {
-                    events.push(StreamEvent::ContentBlockDelta {
-                        index,
-                        delta: Delta::InputJsonDelta {
-                            partial_json: args.clone(),
-                        },
-                    });
+            if let Some(function) = &tool_call.function {
+                if let Some(n) = &function.name {
+                    name = n.clone();
+                }
+                if let Some(args) = &function.arguments {
+                    arguments = args.clone();
                 }
             }
+
+            state.buffered_tool_calls.push(BufferedToolCall {
+                id,
+                name,
+                arguments,
+                openai_index,
+            });
         }
     }
 }
@@ -398,9 +475,27 @@ mod tests {
             &mut state,
             &tool_start_chunk("1", "gpt-4o", "call_abc", "read_file"),
         );
-        assert_eq!(event_types(&e1), ["message_start", "content_block_start"]);
+        assert_eq!(event_types(&e1), ["message_start"]);
 
-        if let StreamEvent::ContentBlockStart { content_block, .. } = &e1[1] {
+        let e2 = translate_chunk(
+            &mut state,
+            &tool_args_chunk("1", "gpt-4o", "{\"path\":\"/tmp\"}"),
+        );
+        assert!(event_types(&e2).is_empty());
+
+        let e3 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "tool_calls"));
+        assert_eq!(
+            event_types(&e3),
+            [
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta"
+            ]
+        );
+
+        if let StreamEvent::ContentBlockStart { content_block, index } = &e3[0] {
+            assert_eq!(*index, 0);
             match content_block {
                 ContentBlockStart::ToolUse { id, name } => {
                     assert_eq!(id, "call_abc");
@@ -410,16 +505,17 @@ mod tests {
             }
         }
 
-        let e2 = translate_chunk(
-            &mut state,
-            &tool_args_chunk("1", "gpt-4o", "{\"path\":\"/tmp\"}"),
-        );
-        assert_eq!(event_types(&e2), ["content_block_delta"]);
+        if let StreamEvent::ContentBlockDelta { delta, index } = &e3[1] {
+            assert_eq!(*index, 0);
+            match delta {
+                Delta::InputJsonDelta { partial_json } => {
+                    assert_eq!(partial_json, "{\"path\":\"/tmp\"}");
+                }
+                _ => panic!("expected InputJsonDelta"),
+            }
+        }
 
-        let e3 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "tool_calls"));
-        assert_eq!(event_types(&e3), ["content_block_stop", "message_delta"]);
-
-        if let StreamEvent::MessageDelta { delta, .. } = &e3[1] {
+        if let StreamEvent::MessageDelta { delta, .. } = &e3[3] {
             assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
         }
     }
@@ -453,8 +549,8 @@ mod tests {
             &tool_start_chunk("1", "gpt-4o", "call_xyz", "read_file"),
         );
 
-        assert!(event_types(&e2).contains(&"content_block_stop"));
-        assert!(event_types(&e2).contains(&"content_block_start"));
+        // The text block should be stopped because tool_calls commenced.
+        assert_eq!(event_types(&e2), ["content_block_stop"]);
     }
 
     #[test]
@@ -513,5 +609,77 @@ mod tests {
             .filter(|e| matches!(e, StreamEvent::ContentBlockDelta { .. }))
             .collect();
         assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn streaming_deduplication() {
+        let mut state = initial_state("fallback".into());
+
+        // Stream first tool call
+        let _e1 = translate_chunk(&mut state, &tool_start_chunk("1", "gpt-4o", "call_1", "read_file"));
+        let _e2 = translate_chunk(&mut state, &tool_args_chunk("1", "gpt-4o", "{\"path\":\"/tmp\"}"));
+
+        // Stream a second identical tool call (as a separate tool call index / id)
+        let chunk3: openai::StreamChunk = serde_json::from_value(json!({
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 1, "id": "call_2", "type": "function", "function": { "name": "read_file" } }]
+            }}]
+        })).unwrap();
+        let _e3 = translate_chunk(&mut state, &chunk3);
+
+        let chunk4: openai::StreamChunk = serde_json::from_value(json!({
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 1, "function": { "arguments": "{\"path\":\"/tmp\"}" } }]
+            }}]
+        })).unwrap();
+        let _e4 = translate_chunk(&mut state, &chunk4);
+
+        // Stream a third distinct tool call
+        let chunk5: openai::StreamChunk = serde_json::from_value(json!({
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 2, "id": "call_3", "type": "function", "function": { "name": "read_file" } }]
+            }}]
+        })).unwrap();
+        let _e5 = translate_chunk(&mut state, &chunk5);
+
+        let chunk6: openai::StreamChunk = serde_json::from_value(json!({
+            "choices": [{ "index": 0, "delta": {
+                "tool_calls": [{ "index": 2, "function": { "arguments": "{\"path\":\"/etc/hosts\"}" } }]
+            }}]
+        })).unwrap();
+        let _e6 = translate_chunk(&mut state, &chunk6);
+
+        // Finish stream
+        let e7 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "tool_calls"));
+
+        let events = event_types(&e7);
+        // We expect only 2 unique tool call blocks:
+        // call_1 (start, delta, stop) and call_3 (start, delta, stop) + message_delta.
+        assert_eq!(
+            events,
+            [
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta"
+            ]
+        );
+
+        if let StreamEvent::ContentBlockStart { content_block, .. } = &e7[0] {
+            if let ContentBlockStart::ToolUse { id, name } = content_block {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+            } else { panic!("expected ToolUse"); }
+        }
+
+        if let StreamEvent::ContentBlockStart { content_block, .. } = &e7[3] {
+            if let ContentBlockStart::ToolUse { id, name } = content_block {
+                assert_eq!(id, "call_3");
+                assert_eq!(name, "read_file");
+            } else { panic!("expected ToolUse"); }
+        }
     }
 }

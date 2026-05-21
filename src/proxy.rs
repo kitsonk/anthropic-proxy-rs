@@ -687,7 +687,7 @@ mod tests {
         let events = collect_events(chunks, "fallback").await;
         assert_eq!(events[1]["content_block"]["type"], "tool_use");
         assert_eq!(events[1]["content_block"]["id"], "call_abc");
-        assert_eq!(events[5]["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events[4]["delta"]["stop_reason"], "tool_use");
     }
 
     #[tokio::test]
